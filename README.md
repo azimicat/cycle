@@ -7,7 +7,7 @@
 
 ### ブラウザでそのまま使う
 
-👉 **[www.azimicat.dev/cycle](http://www.azimicat.dev/cycle)**
+👉 **[cycle.nekohibachi.com](http://cycle.nekohibachi.com)**
 
 Safari / Chrome でアクセスするだけで使えます。
 
