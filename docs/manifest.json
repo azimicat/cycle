@@ -1,0 +1,16 @@
+{
+  "name": "周期ノート",
+  "short_name": "周期ノート",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#fdf2ee",
+  "theme_color": "#f9a8d4",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

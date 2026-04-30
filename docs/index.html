@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <title>周期ノート</title>
+
+  <!-- PWA manifest (standalone = アドレスバー非表示) -->
+  <link rel="manifest" href="./manifest.json"/>
+  <meta name="mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="default"/>
+  <meta name="apple-mobile-web-app-title" content="周期ノート"/>
+  <meta name="theme-color" content="#f9a8d4"/>
+
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css"/>
+
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body { margin: 0; padding: 0; background: linear-gradient(160deg,#fdf2ee 0%,#fce8f3 50%,#eef3fc 100%); min-height: 100vh; font-family: 'Hiragino Kaku Gothic ProN','Noto Sans JP','Yu Gothic',sans-serif; }
+    input[type="date"]::-webkit-calendar-picker-indicator { opacity: 0.5; }
+    textarea { font-family: monospace; }
+    ::-webkit-scrollbar { display: none; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useCallback } = React;
+
+    // ─── localStorage helpers (完全オフライン・端末内保存) ──────────
+    const STORAGE_KEY  = "cycle-tracker-records";
+    const SETTINGS_KEY = "cycle-tracker-settings";
+    const DEFAULT_SETTINGS = { minCycle: 15, maxCycle: 50 };
+
+    function loadRecords()  { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)  || "[]"); } catch { return []; } }
+    function saveRecords(r) { localStorage.setItem(STORAGE_KEY,  JSON.stringify(r)); }
+    function loadSettings() { try { return { ...DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") }; } catch { return { ...DEFAULT_SETTINGS }; } }
+    function saveSettings(s){ localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); }
+
+    // ─── 日付ユーティリティ ─────────────────────────────────────────
+    const toISO    = d => d.toISOString().slice(0,10);
+    const fromISO  = s => new Date(s+"T00:00:00");
+    const addDays  = (d,n) => { const r=new Date(d); r.setDate(r.getDate()+n); return r; };
+    const diffDays = (a,b) => Math.round((b-a)/86400000);
+
+    function getRawCycles(records) {
+      if (records.length < 2) return [];
+      const sorted = [...records].sort((a,b)=>a.start.localeCompare(b.start));
+      return sorted.slice(1).map((r,i) => ({
+        len: diffDays(fromISO(sorted[i].start), fromISO(r.start)),
+        fromDate: sorted[i].start,
+        toDate: r.start,
+      }));
+    }
+
+    function calcStats(records, {minCycle, maxCycle}) {
+      if (records.length < 2) return null;
+      const allCycles = getRawCycles(records);
+      const valid   = allCycles.filter(c => c.len > minCycle && c.len < maxCycle);
+      const skipped = allCycles.filter(c => c.len <= minCycle || c.len >= maxCycle);
+      if (valid.length === 0) return { avgCycle:null, avgPeriod:null, allCycles, valid, skipped };
+      const avgCycle = Math.round(valid.reduce((a,c)=>a+c.len,0)/valid.length);
+      const sorted = [...records].sort((a,b)=>a.start.localeCompare(b.start));
+      const pLens  = sorted.filter(r=>r.end).map(r=>diffDays(fromISO(r.start),fromISO(r.end))+1);
+      const avgPeriod = pLens.length ? Math.round(pLens.reduce((a,b)=>a+b,0)/pLens.length) : null;
+      return { avgCycle, avgPeriod, allCycles, valid, skipped };
+    }
+
+    function calcPredictions(records, settings) {
+      if (!records.length) return null;
+      const sorted = [...records].sort((a,b)=>b.start.localeCompare(a.start));
+      const stats  = calcStats(records, settings);
+      if (!stats?.avgCycle) return null;
+      const lastStart    = fromISO(sorted[0].start);
+      const nextStart    = addDays(lastStart, stats.avgCycle);
+      const ovulationDay = addDays(nextStart, -14);
+      return {
+        nextStart,
+        nextEnd:      addDays(nextStart, (stats.avgPeriod??5)-1),
+        ovulationDay,
+        fertileStart: addDays(ovulationDay,-3),
+        fertileEnd:   addDays(ovulationDay, 1),
+        cycleLen:     stats.avgCycle,
+        periodLen:    stats.avgPeriod??5,
+      };
+    }
+
+    const getDaysInMonth     = (y,m) => new Date(y,m+1,0).getDate();
+    const getFirstDayOfMonth = (y,m) => new Date(y,m,1).getDay();
+    const MONTH_JA = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"];
+    const DOW_JA   = ["日","月","火","水","木","金","土"];
+
+    // ─── Badge ──────────────────────────────────────────────────────
+    function Badge({color,children}) {
+      const s = {
+        period:    {background:"#ffe4e6",color:"#be123c",border:"1px solid #fecdd3"},
+        fertile:   {background:"#f0fdfa",color:"#0f766e",border:"1px solid #99f6e4"},
+        ovulation: {background:"#fef3c7",color:"#92400e",border:"1px solid #fde68a"},
+        predicted: {background:"#fdf2f8",color:"#9d174d",border:"1px solid #fbcfe8"},
+        skipped:   {background:"#f3f4f6",color:"#6b7280",border:"1px solid #e5e7eb"},
+      };
+      return <span style={{...s[color]||{},fontSize:"11px",padding:"2px 8px",borderRadius:"999px",fontWeight:600}}>{children}</span>;
+    }
+
+    // ─── Settings / Backup Panel ────────────────────────────────────
+    function SettingsPanel({settings, records, onSave, onRestore, onClose}) {
+      const [min, setMin]           = useState(String(settings.minCycle));
+      const [max, setMax]           = useState(String(settings.maxCycle));
+      const [err, setErr]           = useState("");
+      const [backupView, setBV]     = useState(null);
+      const [importText, setIT]     = useState("");
+      const [importErr,  setIE]     = useState("");
+      const [importOk,   setIO]     = useState("");
+
+      const handleSave = () => {
+        const mn=parseInt(min), mx=parseInt(max);
+        if(isNaN(mn)||isNaN(mx)||mn<1||mx<1){setErr("1以上の整数を入力してください");return;}
+        if(mn>=mx){setErr("下限は上限より小さくしてください");return;}
+        onSave({minCycle:mn,maxCycle:mx});
+      };
+
+      // ファイルダウンロード（本物のブラウザなので動作する）
+      const handleExport = () => {
+        const payload = JSON.stringify({version:1,exportedAt:new Date().toISOString(),records,settings},null,2);
+        const blob = new Blob([payload],{type:"application/json"});
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement("a");
+        a.href     = url;
+        a.download = `周期ノート_${toISO(new Date())}.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      };
+
+      // ファイル選択でインポート
+      const handleFileImport = (e) => {
+        setIE(""); setIO("");
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = ev => {
+          try {
+            const data = JSON.parse(ev.target.result);
+            if (!Array.isArray(data.records)) throw new Error("形式が正しくありません");
+            data.records.forEach(r=>{ if(!r.start) throw new Error("不正なデータが含まれています"); });
+            onRestore(data.records, data.settings||settings);
+            setIO(`✓ ${data.records.length}件の記録を復元しました`);
+          } catch(err) { setIE("読み込み失敗："+err.message); }
+        };
+        reader.readAsText(file);
+        e.target.value="";
+      };
+
+      // テキスト貼り付けでインポート
+      const handlePasteImport = () => {
+        setIE(""); setIO("");
+        try {
+          const data = JSON.parse(importText);
+          if (!Array.isArray(data.records)) throw new Error("形式が正しくありません");
+          data.records.forEach(r=>{ if(!r.start) throw new Error("不正なデータが含まれています"); });
+          onRestore(data.records, data.settings||settings);
+          setIO(`✓ ${data.records.length}件の記録を復元しました`);
+          setIT("");
+        } catch(e) { setIE("読み込み失敗："+e.message); }
+      };
+
+      const inputStyle = {borderRadius:"12px",padding:"10px 16px",fontSize:"14px",
+        border:"1.5px solid #fda4af",outline:"none",color:"#7c3a5a",width:"100%",background:"#fff"};
+      const btnPrimary = {borderRadius:"12px",padding:"10px 0",fontSize:"14px",fontWeight:700,
+        background:"linear-gradient(135deg,#f9a8d4,#fda4af)",color:"#7c2d43",border:"none",
+        width:"100%",cursor:"pointer"};
+      const btnGhost = {borderRadius:"12px",padding:"10px 0",fontSize:"14px",fontWeight:600,
+        background:"rgba(0,0,0,0.05)",color:"#9ca3af",border:"none",width:"100%",cursor:"pointer"};
+
+      if (backupView==="import") return (
+        <div>
+          <div style={{display:"flex",alignItems:"center",gap:"8px",marginBottom:"20px"}}>
+            <button onClick={()=>{setBV(null);setIE("");setIO("");setIT("");}}
+              style={{background:"none",border:"none",color:"#c084a0",fontSize:"22px",cursor:"pointer",lineHeight:1}}>‹</button>
+            <h2 style={{color:"#7c3a5a",fontSize:"16px",fontWeight:700,margin:0}}>インポート 📥</h2>
+          </div>
+          <p style={{fontSize:"12px",color:"#9ca3af",lineHeight:1.6,marginBottom:"12px"}}>
+            ① JSONファイルを直接選択するか<br/>② バックアップテキストを貼り付けてください。
+          </p>
+          <p style={{fontSize:"12px",color:"#f43f5e",fontWeight:600,marginBottom:"16px"}}>
+            ⚠ 現在のデータはすべて上書きされます
+          </p>
+
+          {/* ファイル選択 */}
+          <label style={{display:"block",borderRadius:"12px",padding:"10px",fontSize:"13px",
+            fontWeight:700,textAlign:"center",cursor:"pointer",marginBottom:"12px",
+            background:"rgba(255,255,255,0.9)",color:"#9f4e72",border:"1.5px solid #fda4af"}}>
+            📂 JSONファイルを選択
+            <input type="file" accept=".json,application/json" onChange={handleFileImport} style={{display:"none"}}/>
+          </label>
+
+          <p style={{fontSize:"11px",color:"#c084a0",textAlign:"center",margin:"0 0 8px"}}>または</p>
+
+          {/* テキスト貼り付け */}
+          <textarea value={importText} onChange={e=>{setIT(e.target.value);setIE("");setIO("");}}
+            rows={5} placeholder='{"version":1,"records":[...]...} を貼り付け'
+            style={{...inputStyle,resize:"none",fontFamily:"monospace",fontSize:"11px",
+              background:"rgba(249,168,212,0.05)",marginBottom:"8px"}}/>
+
+          {importErr && <p style={{fontSize:"12px",color:"#f43f5e",marginBottom:"8px"}}>{importErr}</p>}
+          {importOk  && <p style={{fontSize:"12px",color:"#10b981",marginBottom:"8px"}}>{importOk}</p>}
+
+          <button onClick={handlePasteImport} disabled={!importText.trim()}
+            style={{...btnPrimary,opacity:importText.trim()?1:0.5}}>テキストから復元する</button>
+        </div>
+      );
+
+      return (
+        <div>
+          <h2 style={{color:"#7c3a5a",fontSize:"16px",fontWeight:700,marginBottom:"20px"}}>設定 ⚙️</h2>
+
+          {/* Backup */}
+          <p style={{fontSize:"12px",fontWeight:700,color:"#c084a0",marginBottom:"8px"}}>📦 バックアップ</p>
+          <div style={{background:"rgba(249,168,212,0.08)",border:"1px solid rgba(249,168,212,0.2)",
+            borderRadius:"16px",padding:"16px",marginBottom:"20px",display:"flex",flexDirection:"column",gap:"8px"}}>
+            <button onClick={handleExport} style={btnPrimary}>⬇ エクスポート（JSONファイルを保存）</button>
+            <button onClick={()=>setBV("import")}
+              style={{...btnGhost,color:"#9f4e72",border:"1.5px solid #fda4af",background:"rgba(255,255,255,0.8)"}}>
+              ⬆ インポート（バックアップから復元）
+            </button>
+          </div>
+
+          {/* Filter */}
+          <p style={{fontSize:"12px",fontWeight:700,color:"#c084a0",marginBottom:"8px"}}>🚫 外れ値フィルター</p>
+          <p style={{fontSize:"12px",color:"#9ca3af",lineHeight:1.6,marginBottom:"16px"}}>
+            設定した日数以下・以上の周期は統計・予測から除外されます。記録は削除されません。
+          </p>
+          <div style={{display:"flex",flexDirection:"column",gap:"12px",marginBottom:"8px"}}>
+            <div>
+              <label style={{fontSize:"12px",fontWeight:700,color:"#c084a0",display:"block",marginBottom:"6px"}}>
+                下限（この日数以下の周期を除外）
+              </label>
+              <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+                <input type="number" min="1" max="29" value={min} onChange={e=>setMin(e.target.value)}
+                  style={{...inputStyle,width:"80px",textAlign:"center",fontWeight:700}}/>
+                <span style={{fontSize:"13px",color:"#c084a0"}}>日以下を除外</span>
+              </div>
+            </div>
+            <div>
+              <label style={{fontSize:"12px",fontWeight:700,color:"#c084a0",display:"block",marginBottom:"6px"}}>
+                上限（この日数以上の周期を除外）
+              </label>
+              <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+                <input type="number" min="30" max="365" value={max} onChange={e=>setMax(e.target.value)}
+                  style={{...inputStyle,width:"80px",textAlign:"center",fontWeight:700}}/>
+                <span style={{fontSize:"13px",color:"#c084a0"}}>日以上を除外</span>
+              </div>
+            </div>
+          </div>
+          {err && <p style={{fontSize:"12px",color:"#f43f5e",marginBottom:"8px"}}>{err}</p>}
+          <div style={{background:"rgba(249,168,212,0.1)",borderRadius:"12px",padding:"10px",marginBottom:"20px"}}>
+            <p style={{fontSize:"12px",color:"#c084a0",margin:0}}>
+              現在：<strong style={{color:"#7c3a5a"}}>{min}日以下</strong>と
+              <strong style={{color:"#7c3a5a"}}>{max}日以上</strong>を除外
+            </p>
+          </div>
+          <div style={{display:"flex",gap:"10px"}}>
+            <button onClick={onClose} style={{...btnGhost,flex:1}}>キャンセル</button>
+            <button onClick={handleSave} style={{...btnPrimary,flex:1}}>保存</button>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── Main App ───────────────────────────────────────────────────
+    function App() {
+      const [records,     setRecords]     = useState(()=>loadRecords());
+      const [settings,    setSettings]    = useState(()=>loadSettings());
+      const [tab,         setTab]         = useState("calendar");
+      const [calYear,     setCalYear]     = useState(()=>new Date().getFullYear());
+      const [calMonth,    setCalMonth]    = useState(()=>new Date().getMonth());
+      const [selectedDay, setSelectedDay] = useState(null);
+      const [modal,       setModal]       = useState(null);
+      const [form,        setForm]        = useState({start:"",end:"",note:""});
+      const [toast,       setToast]       = useState(null);
+
+      const showToast = (msg,type="ok") => {
+        setToast({msg,type}); setTimeout(()=>setToast(null),2500);
+      };
+
+      const handleSaveSettings = s => { saveSettings(s); setSettings(s); setModal(null); showToast("設定を保存しました ✓"); };
+      const handleRestore = (rs, rs2) => { saveRecords(rs); saveSettings(rs2); setRecords(rs); setSettings(rs2); };
+
+      const stats = calcStats(records, settings);
+      const preds = calcPredictions(records, settings);
+
+      const tagMap = useCallback(()=>{
+        const map={};
+        const tag=(iso,t)=>{ if(!map[iso])map[iso]=new Set(); map[iso].add(t); };
+        records.forEach(r=>{
+          let d=fromISO(r.start); const end=r.end?fromISO(r.end):fromISO(r.start);
+          while(d<=end){tag(toISO(d),"period");d=addDays(d,1);}
+        });
+        if(preds){
+          let d=new Date(preds.nextStart); while(d<=preds.nextEnd){tag(toISO(d),"predicted");d=addDays(d,1);}
+          d=new Date(preds.fertileStart); while(d<=preds.fertileEnd){tag(toISO(d),"fertile");d=addDays(d,1);}
+          tag(toISO(preds.ovulationDay),"ovulation");
+        }
+        return map;
+      },[records,preds])();
+
+      const handleDayClick = iso => {
+        setSelectedDay(iso);
+        const ex=records.find(r=>r.start<=iso&&(r.end?r.end>=iso:r.start===iso));
+        if(ex) setModal("view"); else {setForm({start:iso,end:"",note:""});setModal("add");}
+      };
+
+      const handleSave = () => {
+        if(!form.start)return;
+        const updated=[...records.filter(r=>r.id!==form.id)];
+        updated.push({id:form.id||Date.now().toString(),start:form.start,end:form.end||null,note:form.note});
+        saveRecords(updated); setRecords(updated); setModal(null);
+        showToast("記録を保存しました ✓");
+      };
+
+      const handleDelete = id => {
+        const updated=records.filter(r=>r.id!==id);
+        saveRecords(updated); setRecords(updated); setModal(null);
+        showToast("削除しました","warn");
+      };
+
+      const today=toISO(new Date());
+      const prevMonth=()=>{if(calMonth===0){setCalYear(y=>y-1);setCalMonth(11);}else setCalMonth(m=>m-1);};
+      const nextMonth=()=>{if(calMonth===11){setCalYear(y=>y+1);setCalMonth(0);}else setCalMonth(m=>m+1);};
+
+      // ── styles ──
+      const card = {background:"rgba(255,255,255,0.85)",borderRadius:"20px",padding:"16px",boxShadow:"0 1px 4px rgba(0,0,0,0.06)"};
+      const inputStyle = {borderRadius:"12px",padding:"10px 16px",fontSize:"14px",
+        border:"1.5px solid #fda4af",outline:"none",color:"#7c3a5a",width:"100%",background:"#fff"};
+      const btnPrimary = {borderRadius:"12px",padding:"10px 0",fontSize:"14px",fontWeight:700,
+        background:"linear-gradient(135deg,#f9a8d4,#fda4af)",color:"#7c2d43",border:"none",cursor:"pointer"};
+      const btnGhost = {borderRadius:"12px",padding:"10px 0",fontSize:"14px",fontWeight:600,
+        background:"rgba(0,0,0,0.05)",color:"#9ca3af",border:"none",cursor:"pointer"};
+
+      return (
+        <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",
+          fontFamily:"'Hiragino Kaku Gothic ProN','Noto Sans JP',sans-serif",
+          background:"linear-gradient(160deg,#fdf2ee 0%,#fce8f3 50%,#eef3fc 100%)"}}>
+
+          {/* Header */}
+          <header style={{padding:"28px 20px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div style={{display:"flex",gap:"12px",alignItems:"center"}}>
+              <div style={{width:42,height:42,borderRadius:14,display:"flex",alignItems:"center",justifyContent:"center",
+                fontSize:22,background:"linear-gradient(135deg,#f9a8d4,#fda4af)"}}>🌸</div>
+              <div>
+                <h1 style={{color:"#7c3a5a",fontSize:"20px",fontWeight:700,margin:0,letterSpacing:"0.02em"}}>周期ノート</h1>
+                <p style={{color:"#c084a0",fontSize:"11px",margin:0}}>あなただけの記録</p>
+              </div>
+            </div>
+            <button onClick={()=>setModal("settings")} style={{width:38,height:38,borderRadius:14,
+              border:"none",background:"rgba(255,255,255,0.7)",fontSize:18,cursor:"pointer",color:"#c084a0"}}>⚙️</button>
+          </header>
+
+          {/* Prediction card */}
+          {preds ? (
+            <div style={{margin:"0 16px 16px",borderRadius:20,padding:"16px",boxShadow:"0 1px 4px rgba(0,0,0,0.06)",
+              background:"linear-gradient(135deg,rgba(255,255,255,0.9),rgba(255,240,248,0.9))",
+              border:"1px solid rgba(249,168,212,0.3)"}}>
+              <p style={{fontSize:"11px",fontWeight:700,color:"#c084a0",marginBottom:"10px"}}>次回の予測</p>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px"}}>
+                <div style={{borderRadius:14,padding:"12px",background:"rgba(253,164,175,0.15)"}}>
+                  <p style={{fontSize:"11px",color:"#9f4e72",margin:"0 0 4px"}}>🩸 生理開始予定</p>
+                  <p style={{fontSize:"14px",fontWeight:700,color:"#7c3a5a",margin:"0 0 2px"}}>
+                    {MONTH_JA[preds.nextStart.getMonth()]} {preds.nextStart.getDate()}日
+                  </p>
+                  <p style={{fontSize:"11px",color:"#c084a0",margin:0}}>
+                    あと {Math.max(0,diffDays(new Date(),preds.nextStart))} 日
+                  </p>
+                </div>
+                <div style={{borderRadius:14,padding:"12px",background:"rgba(20,184,166,0.08)"}}>
+                  <p style={{fontSize:"11px",color:"#0f766e",margin:"0 0 4px"}}>🌿 排卵日予測</p>
+                  <p style={{fontSize:"14px",fontWeight:700,color:"#115e59",margin:"0 0 2px"}}>
+                    {MONTH_JA[preds.ovulationDay.getMonth()]} {preds.ovulationDay.getDate()}日
+                  </p>
+                  <p style={{fontSize:"11px",color:"#5eead4",margin:0}}>平均周期 {preds.cycleLen} 日</p>
+                </div>
+              </div>
+              {stats?.skipped?.length>0 && (
+                <p style={{fontSize:"11px",color:"#c084a0",margin:"10px 0 0",
+                  paddingTop:"10px",borderTop:"1px solid rgba(249,168,212,0.2)"}}>
+                  ⚠ {stats.skipped.length}件の外れ値を予測から除外中
+                </p>
+              )}
+            </div>
+          ) : records.length>=2 ? (
+            <div style={{margin:"0 16px 16px",borderRadius:20,padding:"14px",
+              background:"rgba(255,255,255,0.7)",border:"1px solid rgba(249,168,212,0.3)"}}>
+              <p style={{fontSize:"12px",color:"#c084a0",margin:0}}>
+                ⚠ すべての周期が外れ値フィルターで除外されています。⚙️から設定を見直してください。
+              </p>
+            </div>
+          ) : null}
+
+          {/* Tabs */}
+          <div style={{margin:"0 16px 12px",display:"flex",gap:"4px",padding:"4px",
+            borderRadius:18,background:"rgba(255,255,255,0.6)"}}>
+            {[["calendar","📅 カレンダー"],["history","📋 記録"],["stats","📊 統計"]].map(([id,label])=>(
+              <button key={id} onClick={()=>setTab(id)} style={{flex:1,padding:"8px 0",fontSize:"13px",
+                borderRadius:14,border:"none",cursor:"pointer",fontWeight:tab===id?700:400,
+                background:tab===id?"linear-gradient(135deg,#f9a8d4,#fda4af)":"transparent",
+                color:tab===id?"#7c2d43":"#c084a0"}}>{label}</button>
+            ))}
+          </div>
+
+          {/* Content */}
+          <div style={{flex:1,margin:"0 16px 24px"}}>
+
+            {/* ── Calendar ── */}
+            {tab==="calendar" && (
+              <div style={card}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"16px"}}>
+                  <button onClick={prevMonth} style={{width:34,height:34,borderRadius:"50%",border:"none",
+                    background:"none",color:"#f9a8d4",fontSize:"22px",cursor:"pointer"}}>‹</button>
+                  <span style={{color:"#7c3a5a",fontSize:"15px",fontWeight:700}}>{calYear}年 {MONTH_JA[calMonth]}</span>
+                  <button onClick={nextMonth} style={{width:34,height:34,borderRadius:"50%",border:"none",
+                    background:"none",color:"#f9a8d4",fontSize:"22px",cursor:"pointer"}}>›</button>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",marginBottom:"8px"}}>
+                  {DOW_JA.map((d,i)=>(
+                    <div key={d} style={{textAlign:"center",fontSize:"11px",fontWeight:700,padding:"4px 0",
+                      color:i===0?"#f43f5e":i===6?"#3b82f6":"#9ca3af"}}>{d}</div>
+                  ))}
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:"2px 0"}}>
+                  {Array.from({length:getFirstDayOfMonth(calYear,calMonth)}).map((_,i)=><div key={"e"+i}/>)}
+                  {Array.from({length:getDaysInMonth(calYear,calMonth)}).map((_,i)=>{
+                    const day=i+1;
+                    const iso=`${calYear}-${String(calMonth+1).padStart(2,"0")}-${String(day).padStart(2,"0")}`;
+                    const tags=tagMap[iso]||new Set();
+                    const isToday=iso===today;
+                    const dow=new Date(iso).getDay();
+                    let bg="transparent";
+                    let tc=dow===0?"#f43f5e":dow===6?"#3b82f6":"#374151";
+                    if(tags.has("period")){bg="rgba(253,164,175,0.5)";tc="#9f1239";}
+                    else if(tags.has("ovulation")){bg="rgba(251,191,36,0.4)";tc="#92400e";}
+                    else if(tags.has("fertile")){bg="rgba(20,184,166,0.15)";tc="#0f766e";}
+                    else if(tags.has("predicted")){bg="rgba(249,168,212,0.25)";tc="#9d174d";}
+                    return (
+                      <button key={iso} onClick={()=>handleDayClick(iso)}
+                        style={{position:"relative",display:"flex",flexDirection:"column",alignItems:"center",
+                          justifyContent:"center",borderRadius:10,padding:"6px 0",minHeight:40,border:"none",
+                          cursor:"pointer",background:bg}}>
+                        {isToday && <span style={{position:"absolute",top:3,right:4,width:6,height:6,
+                          borderRadius:"50%",background:"#f43f5e"}}/>}
+                        <span style={{fontSize:"13px",fontWeight:500,color:tc}}>{day}</span>
+                        {tags.has("ovulation") && <span style={{fontSize:"10px",lineHeight:1}}>🌿</span>}
+                        {tags.has("period") && <span style={{width:4,height:4,borderRadius:"50%",
+                          background:"#f43f5e",marginTop:2}}/>}
+                      </button>
+                    );
+                  })}
+                </div>
+                <div style={{display:"flex",flexWrap:"wrap",gap:"8px",marginTop:"16px",
+                  paddingTop:"12px",borderTop:"1px solid rgba(249,168,212,0.2)"}}>
+                  {[["rgba(253,164,175,0.5)","生理中"],["rgba(249,168,212,0.25)","生理予測"],
+                    ["rgba(20,184,166,0.15)","妊娠しやすい日"],["rgba(251,191,36,0.4)","排卵日"]
+                  ].map(([bg,label])=>(
+                    <div key={label} style={{display:"flex",alignItems:"center",gap:"4px"}}>
+                      <span style={{width:12,height:12,borderRadius:3,background:bg,display:"inline-block"}}/>
+                      <span style={{fontSize:"11px",color:"#9ca3af"}}>{label}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* ── History ── */}
+            {tab==="history" && (
+              <div style={{display:"flex",flexDirection:"column",gap:"12px"}}>
+                <button onClick={()=>{setForm({start:today,end:"",note:""});setModal("add");}}
+                  style={{...btnPrimary,padding:"14px 0",fontSize:"14px",borderRadius:18}}>
+                  ＋ 生理を記録する
+                </button>
+                {records.length===0 && (
+                  <div style={{...card,textAlign:"center",padding:"48px 16px",color:"#c084a0",fontSize:"14px"}}>
+                    まだ記録がありません<br/>上のボタンから記録を始めましょう 🌸
+                  </div>
+                )}
+                {(()=>{
+                  const allCycles=getRawCycles(records);
+                  const skippedStarts=new Set(allCycles.filter(c=>c.len<=settings.minCycle||c.len>=settings.maxCycle).map(c=>c.toDate));
+                  return [...records].sort((a,b)=>b.start.localeCompare(a.start)).map(r=>{
+                    const isSkipped=skippedStarts.has(r.start);
+                    const cInfo=allCycles.find(c=>c.toDate===r.start);
+                    return (
+                      <div key={r.id} style={{...card,opacity:isSkipped?0.65:1}}>
+                        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                          <div style={{flex:1,marginRight:8}}>
+                            <div style={{display:"flex",alignItems:"center",gap:"8px",flexWrap:"wrap",marginBottom:"2px"}}>
+                              <span style={{fontSize:"14px",fontWeight:700,color:"#7c3a5a"}}>
+                                {fromISO(r.start).getFullYear()}年 {MONTH_JA[fromISO(r.start).getMonth()]} {fromISO(r.start).getDate()}日
+                                {r.end&&` 〜 ${fromISO(r.end).getDate()}日`}
+                              </span>
+                              {isSkipped&&<Badge color="skipped">除外中</Badge>}
+                            </div>
+                            {r.end&&<p style={{fontSize:"11px",color:"#c084a0",margin:"0 0 2px"}}>
+                              {diffDays(fromISO(r.start),fromISO(r.end))+1} 日間</p>}
+                            {isSkipped&&cInfo&&<p style={{fontSize:"11px",color:"#9ca3af",margin:0}}>
+                              前周期から {cInfo.len} 日（{cInfo.len<=settings.minCycle?"短すぎ":"長すぎ"}として除外）</p>}
+                            {r.note&&<p style={{fontSize:"11px",color:"#9ca3af",fontStyle:"italic",margin:"4px 0 0"}}>{r.note}</p>}
+                          </div>
+                          <button onClick={()=>{setForm({...r});setModal("add");}}
+                            style={{fontSize:"12px",padding:"4px 12px",borderRadius:999,border:"none",cursor:"pointer",
+                              background:"rgba(249,168,212,0.2)",color:"#9f4e72",whiteSpace:"nowrap"}}>編集</button>
+                        </div>
+                      </div>
+                    );
+                  });
+                })()}
+              </div>
+            )}
+
+            {/* ── Stats ── */}
+            {tab==="stats" && (
+              <div style={{display:"flex",flexDirection:"column",gap:"12px"}}>
+                <div style={{...card,display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 16px"}}>
+                  <div>
+                    <p style={{fontSize:"11px",fontWeight:700,color:"#9ca3af",margin:"0 0 2px"}}>外れ値フィルター</p>
+                    <p style={{fontSize:"12px",color:"#7c3a5a",margin:0}}>{settings.minCycle}日以下 / {settings.maxCycle}日以上を除外</p>
+                  </div>
+                  <button onClick={()=>setModal("settings")}
+                    style={{fontSize:"12px",padding:"6px 12px",borderRadius:999,border:"none",cursor:"pointer",
+                      background:"rgba(249,168,212,0.25)",color:"#9f4e72",fontWeight:700}}>変更</button>
+                </div>
+
+                {!stats||stats.valid.length===0 ? (
+                  <div style={{...card,textAlign:"center",padding:"48px 16px",color:"#c084a0",fontSize:"14px"}}>
+                    有効な記録が2回以上あると<br/>統計が表示されます 📊
+                  </div>
+                ) : (
+                  <>
+                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px"}}>
+                      {[
+                        ["⏱","平均周期",       stats.avgCycle?stats.avgCycle+" 日":"— 日","#f9a8d4","#7c3a5a"],
+                        ["🩸","平均生理期間",   stats.avgPeriod?stats.avgPeriod+" 日":"— 日","#fda4af","#9f1239"],
+                        ["📅","有効な周期数",   stats.valid.length+" 件","#c4b5fd","#4c1d95"],
+                        ["🚫","除外された周期", stats.skipped.length+" 件","#e5e7eb","#6b7280"],
+                      ].map(([icon,label,val,bg,tc])=>(
+                        <div key={label} style={card}>
+                          <div style={{width:34,height:34,borderRadius:12,display:"flex",alignItems:"center",
+                            justifyContent:"center",fontSize:16,marginBottom:8,background:bg+"44"}}>{icon}</div>
+                          <p style={{fontSize:"11px",color:"#9ca3af",margin:"0 0 2px"}}>{label}</p>
+                          <p style={{fontSize:"18px",fontWeight:700,color:tc,margin:0}}>{val}</p>
+                        </div>
+                      ))}
+                    </div>
+
+                    {stats.allCycles.length>=1 && (
+                      <div style={card}>
+                        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"12px"}}>
+                          <p style={{fontSize:"12px",fontWeight:700,color:"#c084a0",margin:0}}>周期の推移</p>
+                          <div style={{display:"flex",gap:"12px"}}>
+                            {[["#fda4af","有効"],["#e5e7eb","除外"]].map(([c,l])=>(
+                              <div key={l} style={{display:"flex",alignItems:"center",gap:4}}>
+                                <span style={{width:10,height:10,borderRadius:3,background:c,display:"inline-block"}}/>
+                                <span style={{fontSize:"11px",color:"#9ca3af"}}>{l}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                        <div style={{display:"flex",alignItems:"flex-end",gap:"4px",height:100}}>
+                          {stats.allCycles.map((c,i)=>{
+                            const isValid=c.len>settings.minCycle&&c.len<settings.maxCycle;
+                            const allLens=stats.allCycles.map(x=>x.len);
+                            const maxL=Math.max(...allLens,35),minL=Math.min(...allLens,21);
+                            const h=((c.len-minL+3)/(maxL-minL+6))*80+10;
+                            return (
+                              <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
+                                <span style={{color:isValid?"#f43f5e":"#d1d5db",fontSize:"9px",fontWeight:700}}>{c.len}</span>
+                                <div style={{width:"100%",borderRadius:"4px 4px 0 0",height:h+"%",
+                                  background:isValid?"linear-gradient(to top,#fda4af,#f9a8d4)":"#e5e7eb"}}/>
+                              </div>
+                            );
+                          })}
+                        </div>
+                        <div style={{display:"flex",justifyContent:"space-between",marginTop:4}}>
+                          <span style={{fontSize:"10px",color:"#d1d5db"}}>← 古い順</span>
+                          <span style={{fontSize:"10px",color:"#d1d5db"}}>新しい順 →</span>
+                        </div>
+                      </div>
+                    )}
+
+                    {stats.skipped.length>0 && (
+                      <div style={card}>
+                        <p style={{fontSize:"12px",fontWeight:700,color:"#9ca3af",marginBottom:"10px"}}>除外された周期の詳細</p>
+                        {stats.skipped.map((c,i)=>(
+                          <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+                            fontSize:"12px",padding:"8px 0",borderBottom:i<stats.skipped.length-1?"1px solid rgba(249,168,212,0.15)":"none"}}>
+                            <span style={{color:"#9ca3af"}}>{c.fromDate} 〜 {c.toDate}</span>
+                            <span style={{fontWeight:700,padding:"2px 8px",borderRadius:999,
+                              background:"rgba(229,231,235,0.8)",color:"#6b7280"}}>
+                              {c.len}日 {c.len<=settings.minCycle?"（短すぎ）":"（長すぎ）"}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* ── Modal ── */}
+          {modal && (
+            <div onClick={e=>{if(e.target===e.currentTarget)setModal(null);}}
+              style={{position:"fixed",inset:0,display:"flex",alignItems:"flex-end",justifyContent:"center",
+                zIndex:50,background:"rgba(0,0,0,0.3)"}}>
+              <div style={{width:"100%",maxWidth:480,borderRadius:"24px 24px 0 0",padding:"24px 24px 36px",
+                boxShadow:"0 -4px 24px rgba(0,0,0,0.12)",
+                background:"linear-gradient(160deg,#fff5f7,#fff)",maxHeight:"90vh",overflowY:"auto"}}>
+
+                {modal==="settings" && (
+                  <SettingsPanel settings={settings} records={records}
+                    onSave={handleSaveSettings} onRestore={handleRestore} onClose={()=>setModal(null)}/>
+                )}
+
+                {modal==="add" && (
+                  <div>
+                    <h2 style={{color:"#7c3a5a",fontSize:"16px",fontWeight:700,marginBottom:"20px"}}>
+                      {form.id?"記録を編集":"生理を記録する"} 🌸
+                    </h2>
+                    <div style={{display:"flex",flexDirection:"column",gap:"14px",marginBottom:"8px"}}>
+                      <div>
+                        <label style={{fontSize:"12px",fontWeight:700,color:"#c084a0",display:"block",marginBottom:"6px"}}>開始日</label>
+                        <input type="date" value={form.start} onChange={e=>setForm(f=>({...f,start:e.target.value}))} style={inputStyle}/>
+                      </div>
+                      <div>
+                        <label style={{fontSize:"12px",fontWeight:700,color:"#c084a0",display:"block",marginBottom:"6px"}}>終了日（省略可）</label>
+                        <input type="date" value={form.end||""} onChange={e=>setForm(f=>({...f,end:e.target.value}))} style={inputStyle}/>
+                      </div>
+                      <div>
+                        <label style={{fontSize:"12px",fontWeight:700,color:"#c084a0",display:"block",marginBottom:"6px"}}>メモ（省略可）</label>
+                        <textarea value={form.note||""} onChange={e=>setForm(f=>({...f,note:e.target.value}))}
+                          rows={2} placeholder="体調や気分など..."
+                          style={{...inputStyle,resize:"none",fontFamily:"inherit"}}/>
+                      </div>
+                    </div>
+                    <div style={{display:"flex",gap:"10px",marginTop:"20px"}}>
+                      {form.id && (
+                        <button onClick={()=>handleDelete(form.id)}
+                          style={{padding:"10px 16px",borderRadius:12,border:"none",cursor:"pointer",
+                            background:"rgba(251,113,133,0.1)",color:"#f43f5e",fontSize:"13px",fontWeight:600}}>削除</button>
+                      )}
+                      <button onClick={()=>setModal(null)} style={{...btnGhost,flex:1}}>キャンセル</button>
+                      <button onClick={handleSave} disabled={!form.start}
+                        style={{...btnPrimary,flex:1,opacity:form.start?1:0.5}}>保存</button>
+                    </div>
+                  </div>
+                )}
+
+                {modal==="view" && selectedDay && (()=>{
+                  const rec=records.find(r=>r.start<=selectedDay&&(r.end?r.end>=selectedDay:r.start===selectedDay));
+                  const tags=tagMap[selectedDay]||new Set();
+                  return (
+                    <div>
+                      <h2 style={{color:"#7c3a5a",fontSize:"16px",fontWeight:700,marginBottom:"14px"}}>
+                        {fromISO(selectedDay).getMonth()+1}月{fromISO(selectedDay).getDate()}日
+                      </h2>
+                      <div style={{display:"flex",flexWrap:"wrap",gap:"6px",marginBottom:"14px"}}>
+                        {tags.has("period")    && <Badge color="period">🩸 生理中</Badge>}
+                        {tags.has("predicted") && <Badge color="predicted">🌸 生理予測日</Badge>}
+                        {tags.has("fertile")   && <Badge color="fertile">🌿 妊娠しやすい日</Badge>}
+                        {tags.has("ovulation") && <Badge color="ovulation">✨ 排卵日予測</Badge>}
+                      </div>
+                      {rec && (
+                        <div style={{borderRadius:12,padding:"12px",marginBottom:"14px",
+                          background:"rgba(249,168,212,0.1)"}}>
+                          <p style={{fontSize:"11px",fontWeight:700,color:"#c084a0",margin:"0 0 4px"}}>記録</p>
+                          <p style={{fontSize:"13px",color:"#7c3a5a",margin:0}}>{rec.start}{rec.end?` 〜 ${rec.end}`:""}</p>
+                          {rec.note&&<p style={{fontSize:"11px",color:"#9ca3af",fontStyle:"italic",margin:"4px 0 0"}}>{rec.note}</p>}
+                        </div>
+                      )}
+                      <div style={{display:"flex",gap:"10px"}}>
+                        {rec && <button onClick={()=>{setForm({...rec});setModal("add");}}
+                          style={{flex:1,...btnGhost,color:"#9f4e72",background:"rgba(249,168,212,0.2)"}}>編集</button>}
+                        <button onClick={()=>setModal(null)} style={{...btnGhost,flex:1}}>閉じる</button>
+                        {!rec && <button onClick={()=>{setForm({start:selectedDay,end:"",note:""});setModal("add");}}
+                          style={{...btnPrimary,flex:1}}>記録する</button>}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+            </div>
+          )}
+
+          {/* Toast */}
+          {toast && (
+            <div style={{position:"fixed",bottom:28,left:"50%",transform:"translateX(-50%)",
+              padding:"10px 20px",borderRadius:999,fontSize:"13px",fontWeight:700,
+              boxShadow:"0 2px 12px rgba(0,0,0,0.15)",zIndex:100,whiteSpace:"nowrap",
+              background:toast.type==="warn"?"rgba(251,113,133,0.95)":"rgba(52,211,153,0.95)",
+              color:"#fff"}}>
+              {toast.msg}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+  </script>
+
+  <!-- サービスワーカー登録（アドレスバー非表示に必要） -->
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js').catch(() => {});
+      });
+    }
+  </script>
+</body>
+</html>
