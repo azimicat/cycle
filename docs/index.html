@@ -49,8 +49,9 @@
     const diffDays = (a,b) => Math.round((b-a)/86400000);
 
     function getRawCycles(records) {
-      if (records.length < 2) return [];
-      const sorted = [...records].sort((a,b)=>a.start.localeCompare(b.start));
+      const pr = records.filter(r=>!r.memoOnly);
+      if (pr.length < 2) return [];
+      const sorted = [...pr].sort((a,b)=>a.start.localeCompare(b.start));
       return sorted.slice(1).map((r,i) => ({
         len: diffDays(fromISO(sorted[i].start), fromISO(r.start)),
         fromDate: sorted[i].start,
@@ -59,22 +60,24 @@
     }
 
     function calcStats(records, {minCycle, maxCycle}) {
-      if (records.length < 2) return null;
-      const allCycles = getRawCycles(records);
+      const pr = records.filter(r=>!r.memoOnly);
+      if (pr.length < 2) return null;
+      const allCycles = getRawCycles(pr);
       const valid   = allCycles.filter(c => c.len > minCycle && c.len < maxCycle);
       const skipped = allCycles.filter(c => c.len <= minCycle || c.len >= maxCycle);
       if (valid.length === 0) return { avgCycle:null, avgPeriod:null, allCycles, valid, skipped };
       const avgCycle = Math.round(valid.reduce((a,c)=>a+c.len,0)/valid.length);
-      const sorted = [...records].sort((a,b)=>a.start.localeCompare(b.start));
+      const sorted = [...pr].sort((a,b)=>a.start.localeCompare(b.start));
       const pLens  = sorted.filter(r=>r.end).map(r=>diffDays(fromISO(r.start),fromISO(r.end))+1);
       const avgPeriod = pLens.length ? Math.round(pLens.reduce((a,b)=>a+b,0)/pLens.length) : null;
       return { avgCycle, avgPeriod, allCycles, valid, skipped };
     }
 
     function calcPredictions(records, settings) {
-      if (!records.length) return null;
-      const sorted = [...records].sort((a,b)=>b.start.localeCompare(a.start));
-      const stats  = calcStats(records, settings);
+      const pr = records.filter(r=>!r.memoOnly);
+      if (!pr.length) return null;
+      const sorted = [...pr].sort((a,b)=>b.start.localeCompare(a.start));
+      const stats  = calcStats(pr, settings);
       if (!stats?.avgCycle) return null;
       const lastStart    = fromISO(sorted[0].start);
       const nextStart    = addDays(lastStart, stats.avgCycle);
@@ -103,6 +106,7 @@
         ovulation: {background:"#fef3c7",color:"#92400e",border:"1px solid #fde68a"},
         predicted: {background:"#fdf2f8",color:"#9d174d",border:"1px solid #fbcfe8"},
         skipped:   {background:"#f3f4f6",color:"#6b7280",border:"1px solid #e5e7eb"},
+        memo:      {background:"#f5f3ff",color:"#7c3aed",border:"1px solid #ddd6fe"},
       };
       return <span style={{...s[color]||{},fontSize:"11px",padding:"2px 8px",borderRadius:"999px",fontWeight:600}}>{children}</span>;
     }
@@ -282,7 +286,7 @@
       const [calMonth,    setCalMonth]    = useState(()=>new Date().getMonth());
       const [selectedDay, setSelectedDay] = useState(null);
       const [modal,       setModal]       = useState(null);
-      const [form,        setForm]        = useState({start:"",end:"",note:""});
+      const [form,        setForm]        = useState({start:"",end:"",note:"",memoOnly:false});
       const [toast,       setToast]       = useState(null);
 
       const showToast = (msg,type="ok") => {
@@ -299,6 +303,7 @@
         const map={};
         const tag=(iso,t)=>{ if(!map[iso])map[iso]=new Set(); map[iso].add(t); };
         records.forEach(r=>{
+          if(r.memoOnly){tag(r.start,"memo");return;}
           let d=fromISO(r.start); const end=r.end?fromISO(r.end):fromISO(r.start);
           while(d<=end){tag(toISO(d),"period");d=addDays(d,1);}
         });
@@ -312,16 +317,25 @@
 
       const handleDayClick = iso => {
         setSelectedDay(iso);
-        const ex=records.find(r=>r.start<=iso&&(r.end?r.end>=iso:r.start===iso));
-        if(ex) setModal("view"); else {setForm({start:iso,end:"",note:""});setModal("add");}
+        const ex=records.find(r=>!r.memoOnly&&r.start<=iso&&(r.end?r.end>=iso:r.start===iso));
+        const memo=records.find(r=>r.memoOnly&&r.start===iso);
+        if(ex||memo) setModal("view"); else {setForm({start:iso,end:"",note:"",memoOnly:false});setModal("add");}
       };
 
       const handleSave = () => {
-        if(!form.start)return;
-        const updated=[...records.filter(r=>r.id!==form.id)];
-        updated.push({id:form.id||Date.now().toString(),start:form.start,end:form.end||null,note:form.note});
-        saveRecords(updated); setRecords(updated); setModal(null);
-        showToast("記録を保存しました ✓");
+        if(form.memoOnly){
+          if(!form.note?.trim())return;
+          const updated=[...records.filter(r=>r.id!==form.id)];
+          updated.push({id:form.id||Date.now().toString(),start:form.start||selectedDay||today,end:null,note:form.note,memoOnly:true});
+          saveRecords(updated); setRecords(updated); setModal(null);
+          showToast("メモを保存しました ✓");
+        } else {
+          if(!form.start)return;
+          const updated=[...records.filter(r=>r.id!==form.id)];
+          updated.push({id:form.id||Date.now().toString(),start:form.start,end:form.end||null,note:form.note});
+          saveRecords(updated); setRecords(updated); setModal(null);
+          showToast("記録を保存しました ✓");
+        }
       };
 
       const handleDelete = id => {
@@ -453,7 +467,10 @@
                           cursor:"pointer",background:bg}}>
                         {isToday && <span style={{position:"absolute",top:3,right:4,width:6,height:6,
                           borderRadius:"50%",background:"#f43f5e"}}/>}
-                        <span style={{fontSize:"13px",fontWeight:500,color:tc}}>{day}</span>
+                        {tags.has("memo")&&tags.has("period")&&<span style={{position:"absolute",top:3,left:4,width:5,height:5,borderRadius:"50%",background:"#8b5cf6"}}/>}
+                        <span style={{fontSize:"13px",fontWeight:500,color:tc,
+                          borderBottom:tags.has("memo")&&!tags.has("period")?"2px solid #8b5cf6":"none",
+                          lineHeight:1.3}}>{day}</span>
                         {tags.has("ovulation") && <span style={{fontSize:"10px",lineHeight:1}}>🌿</span>}
                         {tags.has("period") && <span style={{width:4,height:4,borderRadius:"50%",
                           background:"#f43f5e",marginTop:2}}/>}
@@ -478,10 +495,17 @@
             {/* ── History ── */}
             {tab==="history" && (
               <div style={{display:"flex",flexDirection:"column",gap:"12px"}}>
-                <button onClick={()=>{setForm({start:today,end:"",note:""});setModal("add");}}
-                  style={{...btnPrimary,padding:"14px 0",fontSize:"14px",borderRadius:18}}>
-                  ＋ 生理を記録する
-                </button>
+                <div style={{display:"flex",gap:"8px"}}>
+                  <button onClick={()=>{setForm({start:today,end:"",note:"",memoOnly:false});setModal("add");}}
+                    style={{...btnPrimary,flex:1,padding:"14px 0",fontSize:"14px",borderRadius:18}}>
+                    ＋ 生理を記録する
+                  </button>
+                  <button onClick={()=>{setForm({start:today,end:"",note:"",memoOnly:true});setModal("add");}}
+                    style={{padding:"14px 16px",borderRadius:18,border:"none",cursor:"pointer",fontSize:"14px",
+                      background:"rgba(139,92,246,0.1)",color:"#7c3aed",fontWeight:700,whiteSpace:"nowrap"}}>
+                    📝 メモ
+                  </button>
+                </div>
                 {records.length===0 && (
                   <div style={{...card,textAlign:"center",padding:"48px 16px",color:"#c084a0",fontSize:"14px"}}>
                     まだ記録がありません<br/>上のボタンから記録を始めましょう 🌸
@@ -491,6 +515,24 @@
                   const allCycles=getRawCycles(records);
                   const skippedStarts=new Set(allCycles.filter(c=>c.len<=settings.minCycle||c.len>=settings.maxCycle).map(c=>c.toDate));
                   return [...records].sort((a,b)=>b.start.localeCompare(a.start)).map(r=>{
+                    if(r.memoOnly) return (
+                      <div key={r.id} style={card}>
+                        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                          <div style={{flex:1,marginRight:8}}>
+                            <div style={{display:"flex",alignItems:"center",gap:"6px",marginBottom:"2px"}}>
+                              <span style={{fontSize:"13px"}}>📝</span>
+                              <span style={{fontSize:"14px",fontWeight:700,color:"#7c3a5a"}}>
+                                {fromISO(r.start).getFullYear()}年 {MONTH_JA[fromISO(r.start).getMonth()]} {fromISO(r.start).getDate()}日
+                              </span>
+                            </div>
+                            {r.note&&<p style={{fontSize:"11px",color:"#9ca3af",fontStyle:"italic",margin:"2px 0 0"}}>{r.note}</p>}
+                          </div>
+                          <button onClick={()=>{setForm({...r});setModal("add");}}
+                            style={{fontSize:"12px",padding:"4px 12px",borderRadius:999,border:"none",cursor:"pointer",
+                              background:"rgba(139,92,246,0.1)",color:"#7c3aed",whiteSpace:"nowrap"}}>編集</button>
+                        </div>
+                      </div>
+                    );
                     const isSkipped=skippedStarts.has(r.start);
                     const cInfo=allCycles.find(c=>c.toDate===r.start);
                     return (
@@ -628,23 +670,48 @@
 
                 {modal==="add" && (
                   <div>
-                    <h2 style={{color:"#7c3a5a",fontSize:"16px",fontWeight:700,marginBottom:"20px"}}>
-                      {form.id?"記録を編集":"生理を記録する"} 🌸
+                    <h2 style={{color:"#7c3a5a",fontSize:"16px",fontWeight:700,marginBottom:"16px"}}>
+                      {form.id ? "記録を編集" : form.memoOnly ? "メモを記録する" : "生理を記録する"} {form.memoOnly?"📝":"🌸"}
                     </h2>
+                    <div style={{display:"flex",gap:"4px",marginBottom:"18px",background:"rgba(0,0,0,0.04)",borderRadius:14,padding:"4px"}}>
+                      <button onClick={()=>setForm(f=>({...f,memoOnly:false}))}
+                        style={{flex:1,padding:"8px 0",fontSize:"13px",borderRadius:10,border:"none",cursor:"pointer",
+                          fontWeight:!form.memoOnly?700:400,
+                          background:!form.memoOnly?"linear-gradient(135deg,#f9a8d4,#fda4af)":"transparent",
+                          color:!form.memoOnly?"#7c2d43":"#c084a0"}}>🩸 生理を記録</button>
+                      <button onClick={()=>setForm(f=>({...f,memoOnly:true}))}
+                        style={{flex:1,padding:"8px 0",fontSize:"13px",borderRadius:10,border:"none",cursor:"pointer",
+                          fontWeight:form.memoOnly?700:400,
+                          background:form.memoOnly?"linear-gradient(135deg,#c4b5fd,#8b5cf6)":"transparent",
+                          color:form.memoOnly?"#fff":"#c084a0"}}>📝 メモのみ</button>
+                    </div>
                     <div style={{display:"flex",flexDirection:"column",gap:"14px",marginBottom:"8px"}}>
+                      {!form.memoOnly && (
+                        <>
+                          <div>
+                            <label style={{fontSize:"12px",fontWeight:700,color:"#c084a0",display:"block",marginBottom:"6px"}}>開始日</label>
+                            <input type="date" value={form.start} onChange={e=>setForm(f=>({...f,start:e.target.value}))} style={inputStyle}/>
+                          </div>
+                          <div>
+                            <label style={{fontSize:"12px",fontWeight:700,color:"#c084a0",display:"block",marginBottom:"6px"}}>終了日（省略可）</label>
+                            <input type="date" value={form.end||""} onChange={e=>setForm(f=>({...f,end:e.target.value}))} style={inputStyle}/>
+                          </div>
+                        </>
+                      )}
+                      {form.memoOnly && (
+                        <div>
+                          <label style={{fontSize:"12px",fontWeight:700,color:"#8b5cf6",display:"block",marginBottom:"6px"}}>日付</label>
+                          <input type="date" value={form.start} onChange={e=>setForm(f=>({...f,start:e.target.value}))} style={{...inputStyle,borderColor:"#c4b5fd"}}/>
+                        </div>
+                      )}
                       <div>
-                        <label style={{fontSize:"12px",fontWeight:700,color:"#c084a0",display:"block",marginBottom:"6px"}}>開始日</label>
-                        <input type="date" value={form.start} onChange={e=>setForm(f=>({...f,start:e.target.value}))} style={inputStyle}/>
-                      </div>
-                      <div>
-                        <label style={{fontSize:"12px",fontWeight:700,color:"#c084a0",display:"block",marginBottom:"6px"}}>終了日（省略可）</label>
-                        <input type="date" value={form.end||""} onChange={e=>setForm(f=>({...f,end:e.target.value}))} style={inputStyle}/>
-                      </div>
-                      <div>
-                        <label style={{fontSize:"12px",fontWeight:700,color:"#c084a0",display:"block",marginBottom:"6px"}}>メモ（省略可）</label>
+                        <label style={{fontSize:"12px",fontWeight:700,display:"block",marginBottom:"6px",
+                          color:form.memoOnly?"#8b5cf6":"#c084a0"}}>
+                          メモ{form.memoOnly?"":" （省略可）"}</label>
                         <textarea value={form.note||""} onChange={e=>setForm(f=>({...f,note:e.target.value}))}
-                          rows={2} placeholder="体調や気分など..."
-                          style={{...inputStyle,resize:"none",fontFamily:"inherit"}}/>
+                          rows={form.memoOnly?3:2} placeholder="体調や気分など..."
+                          style={{...inputStyle,resize:"none",fontFamily:"inherit",
+                            borderColor:form.memoOnly?"#c4b5fd":"#fda4af"}}/>
                       </div>
                     </div>
                     <div style={{display:"flex",gap:"10px",marginTop:"20px"}}>
@@ -654,14 +721,18 @@
                             background:"rgba(251,113,133,0.1)",color:"#f43f5e",fontSize:"13px",fontWeight:600}}>削除</button>
                       )}
                       <button onClick={()=>setModal(null)} style={{...btnGhost,flex:1}}>キャンセル</button>
-                      <button onClick={handleSave} disabled={!form.start}
-                        style={{...btnPrimary,flex:1,opacity:form.start?1:0.5}}>保存</button>
+                      <button onClick={handleSave}
+                        disabled={form.memoOnly ? !form.note?.trim() : !form.start}
+                        style={{...btnPrimary,flex:1,
+                          background:form.memoOnly?"linear-gradient(135deg,#c4b5fd,#8b5cf6)":"linear-gradient(135deg,#f9a8d4,#fda4af)",
+                          opacity:(form.memoOnly ? form.note?.trim() : form.start)?1:0.5}}>保存</button>
                     </div>
                   </div>
                 )}
 
                 {modal==="view" && selectedDay && (()=>{
-                  const rec=records.find(r=>r.start<=selectedDay&&(r.end?r.end>=selectedDay:r.start===selectedDay));
+                  const rec=records.find(r=>!r.memoOnly&&r.start<=selectedDay&&(r.end?r.end>=selectedDay:r.start===selectedDay));
+                  const memoRec=records.find(r=>r.memoOnly&&r.start===selectedDay);
                   const tags=tagMap[selectedDay]||new Set();
                   return (
                     <div>
@@ -673,21 +744,33 @@
                         {tags.has("predicted") && <Badge color="predicted">🌸 生理予測日</Badge>}
                         {tags.has("fertile")   && <Badge color="fertile">🌿 妊娠しやすい日</Badge>}
                         {tags.has("ovulation") && <Badge color="ovulation">✨ 排卵日予測</Badge>}
+                        {tags.has("memo")      && <Badge color="memo">📝 メモ</Badge>}
                       </div>
                       {rec && (
                         <div style={{borderRadius:12,padding:"12px",marginBottom:"14px",
                           background:"rgba(249,168,212,0.1)"}}>
-                          <p style={{fontSize:"11px",fontWeight:700,color:"#c084a0",margin:"0 0 4px"}}>記録</p>
+                          <p style={{fontSize:"11px",fontWeight:700,color:"#c084a0",margin:"0 0 4px"}}>🩸 生理記録</p>
                           <p style={{fontSize:"13px",color:"#7c3a5a",margin:0}}>{rec.start}{rec.end?` 〜 ${rec.end}`:""}</p>
                           {rec.note&&<p style={{fontSize:"11px",color:"#9ca3af",fontStyle:"italic",margin:"4px 0 0"}}>{rec.note}</p>}
                         </div>
                       )}
+                      {memoRec && (
+                        <div style={{borderRadius:12,padding:"12px",marginBottom:"14px",
+                          background:"rgba(167,139,250,0.08)"}}>
+                          <p style={{fontSize:"11px",fontWeight:700,color:"#8b5cf6",margin:"0 0 4px"}}>📝 メモ</p>
+                          <p style={{fontSize:"11px",color:"#9ca3af",fontStyle:"italic",margin:0}}>{memoRec.note}</p>
+                        </div>
+                      )}
                       <div style={{display:"flex",gap:"10px"}}>
-                        {rec && <button onClick={()=>{setForm({...rec});setModal("add");}}
+                        {rec && <button onClick={()=>{setForm({...rec,memoOnly:false});setModal("add");}}
                           style={{flex:1,...btnGhost,color:"#9f4e72",background:"rgba(249,168,212,0.2)"}}>編集</button>}
+                        {rec && !memoRec && <button onClick={()=>{setForm({start:selectedDay,end:"",note:"",memoOnly:true});setModal("add");}}
+                          style={{flex:1,...btnGhost,color:"#7c3aed",background:"rgba(139,92,246,0.1)"}}>📝 メモ追加</button>}
+                        {memoRec && <button onClick={()=>{setForm({...memoRec});setModal("add");}}
+                          style={{flex:1,...btnGhost,color:"#7c3aed",background:"rgba(139,92,246,0.1)"}}>メモ編集</button>}
                         <button onClick={()=>setModal(null)} style={{...btnGhost,flex:1}}>閉じる</button>
-                        {!rec && <button onClick={()=>{setForm({start:selectedDay,end:"",note:""});setModal("add");}}
-                          style={{...btnPrimary,flex:1}}>記録する</button>}
+                        {!rec && <button onClick={()=>{setForm({start:selectedDay,end:"",note:"",memoOnly:false});setModal("add");}}
+                          style={{...btnPrimary,flex:1}}>生理を記録する</button>}
                       </div>
                     </div>
                   );
