@@ -37,13 +37,16 @@
     const SETTINGS_KEY = "cycle-tracker-settings";
     const DEFAULT_SETTINGS = { minCycle: 15, maxCycle: 50 };
 
+    const SEX_KEY = "cycle-tracker-sex";
     function loadRecords()  { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)  || "[]"); } catch { return []; } }
     function saveRecords(r) { localStorage.setItem(STORAGE_KEY,  JSON.stringify(r)); }
     function loadSettings() { try { return { ...DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") }; } catch { return { ...DEFAULT_SETTINGS }; } }
     function saveSettings(s){ localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); }
+    function loadSexDates()  { try { return new Set(JSON.parse(localStorage.getItem(SEX_KEY) || "[]")); } catch { return new Set(); } }
+    function saveSexDates(s) { localStorage.setItem(SEX_KEY, JSON.stringify([...s])); }
 
     // ─── 日付ユーティリティ ─────────────────────────────────────────
-    const toISO    = d => d.toISOString().slice(0,10);
+    const toISO    = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
     const fromISO  = s => new Date(s+"T00:00:00");
     const addDays  = (d,n) => { const r=new Date(d); r.setDate(r.getDate()+n); return r; };
     const diffDays = (a,b) => Math.round((b-a)/86400000);
@@ -112,7 +115,7 @@
     }
 
     // ─── Settings / Backup Panel ────────────────────────────────────
-    function SettingsPanel({settings, records, onSave, onRestore, onClose}) {
+    function SettingsPanel({settings, records, sexDates, onSave, onRestore, onClose}) {
       const [min, setMin]           = useState(String(settings.minCycle));
       const [max, setMax]           = useState(String(settings.maxCycle));
       const [err, setErr]           = useState("");
@@ -130,7 +133,7 @@
 
       // ファイルダウンロード（本物のブラウザなので動作する）
       const handleExport = () => {
-        const payload = JSON.stringify({version:1,exportedAt:new Date().toISOString(),records,settings},null,2);
+        const payload = JSON.stringify({version:1,exportedAt:new Date().toISOString(),records,settings,sexDates:[...sexDates]},null,2);
         const blob = new Blob([payload],{type:"application/json"});
         const url  = URL.createObjectURL(blob);
         const a    = document.createElement("a");
@@ -153,7 +156,7 @@
             const data = JSON.parse(ev.target.result);
             if (!Array.isArray(data.records)) throw new Error("形式が正しくありません");
             data.records.forEach(r=>{ if(!r.start) throw new Error("不正なデータが含まれています"); });
-            onRestore(data.records, data.settings||settings);
+            onRestore(data.records, data.settings||settings, data.sexDates||[]);
             setIO(`✓ ${data.records.length}件の記録を復元しました`);
           } catch(err) { setIE("読み込み失敗："+err.message); }
         };
@@ -168,7 +171,7 @@
           const data = JSON.parse(importText);
           if (!Array.isArray(data.records)) throw new Error("形式が正しくありません");
           data.records.forEach(r=>{ if(!r.start) throw new Error("不正なデータが含まれています"); });
-          onRestore(data.records, data.settings||settings);
+          onRestore(data.records, data.settings||settings, data.sexDates||[]);
           setIO(`✓ ${data.records.length}件の記録を復元しました`);
           setIT("");
         } catch(e) { setIE("読み込み失敗："+e.message); }
@@ -288,13 +291,19 @@
       const [modal,       setModal]       = useState(null);
       const [form,        setForm]        = useState({start:"",end:"",note:"",memoOnly:false});
       const [toast,       setToast]       = useState(null);
+      const [sexDates,    setSexDates]    = useState(()=>loadSexDates());
+      const [deleteConfirm, setDeleteConfirm] = useState(false);
+      useEffect(()=>{setDeleteConfirm(false);},[modal]);
 
       const showToast = (msg,type="ok") => {
         setToast({msg,type}); setTimeout(()=>setToast(null),2500);
       };
 
       const handleSaveSettings = s => { saveSettings(s); setSettings(s); setModal(null); showToast("設定を保存しました ✓"); };
-      const handleRestore = (rs, rs2) => { saveRecords(rs); saveSettings(rs2); setRecords(rs); setSettings(rs2); };
+      const handleRestore = (rs, rs2, sd) => {
+        saveRecords(rs); saveSettings(rs2); setRecords(rs); setSettings(rs2);
+        const s=new Set(sd||[]); saveSexDates(s); setSexDates(s);
+      };
 
       const stats = calcStats(records, settings);
       const preds = calcPredictions(records, settings);
@@ -307,19 +316,27 @@
           let d=fromISO(r.start); const end=r.end?fromISO(r.end):fromISO(r.start);
           while(d<=end){tag(toISO(d),"period");d=addDays(d,1);}
         });
+        sexDates.forEach(iso=>tag(iso,"sex"));
         if(preds){
           let d=new Date(preds.nextStart); while(d<=preds.nextEnd){tag(toISO(d),"predicted");d=addDays(d,1);}
           d=new Date(preds.fertileStart); while(d<=preds.fertileEnd){tag(toISO(d),"fertile");d=addDays(d,1);}
           tag(toISO(preds.ovulationDay),"ovulation");
         }
         return map;
-      },[records,preds])();
+      },[records,preds,sexDates])();
 
       const handleDayClick = iso => {
         setSelectedDay(iso);
-        const ex=records.find(r=>!r.memoOnly&&r.start<=iso&&(r.end?r.end>=iso:r.start===iso));
-        const memo=records.find(r=>r.memoOnly&&r.start===iso);
-        if(ex||memo) setModal("view"); else {setForm({start:iso,end:"",note:"",memoOnly:false});setModal("add");}
+        const ex   = records.find(r=>!r.memoOnly&&r.start<=iso&&(r.end?r.end>=iso:r.start===iso));
+        const memo = records.find(r=>r.memoOnly&&r.start===iso);
+        if(ex||memo){ setModal("view"); return; }
+        const latestPeriod=[...records].filter(r=>!r.memoOnly).sort((a,b)=>b.start.localeCompare(a.start))[0];
+        if(latestPeriod&&!latestPeriod.end&&latestPeriod.start<iso){
+          setForm({...latestPeriod,end:iso});
+        } else {
+          setForm({start:iso,end:"",note:"",memoOnly:false});
+        }
+        setModal("add");
       };
 
       const handleSave = () => {
@@ -331,6 +348,9 @@
           showToast("メモを保存しました ✓");
         } else {
           if(!form.start)return;
+          if(!form.id && records.some(r=>!r.memoOnly&&!r.end)){
+            showToast("終了日が未入力の記録があります","warn"); return;
+          }
           const updated=[...records.filter(r=>r.id!==form.id)];
           updated.push({id:form.id||Date.now().toString(),start:form.start,end:form.end||null,note:form.note});
           saveRecords(updated); setRecords(updated); setModal(null);
@@ -342,6 +362,12 @@
         const updated=records.filter(r=>r.id!==id);
         saveRecords(updated); setRecords(updated); setModal(null);
         showToast("削除しました","warn");
+      };
+
+      const toggleSex = iso => {
+        const updated=new Set(sexDates);
+        if(updated.has(iso)) updated.delete(iso); else updated.add(iso);
+        saveSexDates(updated); setSexDates(updated);
       };
 
       const today=toISO(new Date());
@@ -468,6 +494,7 @@
                         {isToday && <span style={{position:"absolute",top:3,right:4,width:6,height:6,
                           borderRadius:"50%",background:"#f43f5e"}}/>}
                         {tags.has("memo")&&tags.has("period")&&<span style={{position:"absolute",top:3,left:4,width:5,height:5,borderRadius:"50%",background:"#8b5cf6"}}/>}
+                        {tags.has("sex")&&<span style={{position:"absolute",bottom:2,right:3,fontSize:"8px",color:"#fb7185",lineHeight:1}}>♥</span>}
                         <span style={{fontSize:"13px",fontWeight:500,color:tc,
                           borderBottom:tags.has("memo")&&!tags.has("period")?"2px solid #8b5cf6":"none",
                           lineHeight:1.3}}>{day}</span>
@@ -664,69 +691,118 @@
                 background:"linear-gradient(160deg,#fff5f7,#fff)",maxHeight:"90vh",overflowY:"auto"}}>
 
                 {modal==="settings" && (
-                  <SettingsPanel settings={settings} records={records}
+                  <SettingsPanel settings={settings} records={records} sexDates={sexDates}
                     onSave={handleSaveSettings} onRestore={handleRestore} onClose={()=>setModal(null)}/>
                 )}
 
                 {modal==="add" && (
                   <div>
-                    <h2 style={{color:"#7c3a5a",fontSize:"16px",fontWeight:700,marginBottom:"16px"}}>
-                      {form.id ? "記録を編集" : form.memoOnly ? "メモを記録する" : "生理を記録する"} {form.memoOnly?"📝":"🌸"}
-                    </h2>
-                    <div style={{display:"flex",gap:"4px",marginBottom:"18px",background:"rgba(0,0,0,0.04)",borderRadius:14,padding:"4px"}}>
-                      <button onClick={()=>setForm(f=>({...f,memoOnly:false}))}
-                        style={{flex:1,padding:"8px 0",fontSize:"13px",borderRadius:10,border:"none",cursor:"pointer",
-                          fontWeight:!form.memoOnly?700:400,
-                          background:!form.memoOnly?"linear-gradient(135deg,#f9a8d4,#fda4af)":"transparent",
-                          color:!form.memoOnly?"#7c2d43":"#c084a0"}}>🩸 生理を記録</button>
-                      <button onClick={()=>setForm(f=>({...f,memoOnly:true}))}
-                        style={{flex:1,padding:"8px 0",fontSize:"13px",borderRadius:10,border:"none",cursor:"pointer",
-                          fontWeight:form.memoOnly?700:400,
-                          background:form.memoOnly?"linear-gradient(135deg,#c4b5fd,#8b5cf6)":"transparent",
-                          color:form.memoOnly?"#fff":"#c084a0"}}>📝 メモのみ</button>
-                    </div>
-                    <div style={{display:"flex",flexDirection:"column",gap:"14px",marginBottom:"8px"}}>
-                      {!form.memoOnly && (
-                        <>
-                          <div>
-                            <label style={{fontSize:"12px",fontWeight:700,color:"#c084a0",display:"block",marginBottom:"6px"}}>開始日</label>
-                            <input type="date" value={form.start} onChange={e=>setForm(f=>({...f,start:e.target.value}))} style={inputStyle}/>
-                          </div>
-                          <div>
-                            <label style={{fontSize:"12px",fontWeight:700,color:"#c084a0",display:"block",marginBottom:"6px"}}>終了日（省略可）</label>
-                            <input type="date" value={form.end||""} onChange={e=>setForm(f=>({...f,end:e.target.value}))} style={inputStyle}/>
-                          </div>
-                        </>
-                      )}
-                      {form.memoOnly && (
-                        <div>
-                          <label style={{fontSize:"12px",fontWeight:700,color:"#8b5cf6",display:"block",marginBottom:"6px"}}>日付</label>
-                          <input type="date" value={form.start} onChange={e=>setForm(f=>({...f,start:e.target.value}))} style={{...inputStyle,borderColor:"#c4b5fd"}}/>
+                    {deleteConfirm ? (
+                      <>
+                        <h2 style={{color:"#f43f5e",fontSize:"16px",fontWeight:700,marginBottom:"16px"}}>記録の削除</h2>
+                        <div style={{borderRadius:16,padding:"16px",marginBottom:"20px",
+                          background:"rgba(251,113,133,0.08)",border:"1px solid rgba(251,113,133,0.2)"}}>
+                          <p style={{fontSize:"14px",color:"#7c3a5a",fontWeight:600,margin:"0 0 8px",lineHeight:1.5}}>
+                            {records.find(r=>r.id===form.id)?.end
+                              ? `生理期間（${fromISO(form.start).getMonth()+1}月${fromISO(form.start).getDate()}日〜${fromISO(form.end).getMonth()+1}月${fromISO(form.end).getDate()}日）を削除します`
+                              : `開始日（${fromISO(form.start).getMonth()+1}月${fromISO(form.start).getDate()}日）を削除します`}
+                          </p>
+                          <p style={{fontSize:"12px",color:"#9ca3af",margin:0}}>この操作は元に戻せません。</p>
                         </div>
-                      )}
-                      <div>
-                        <label style={{fontSize:"12px",fontWeight:700,display:"block",marginBottom:"6px",
-                          color:form.memoOnly?"#8b5cf6":"#c084a0"}}>
-                          メモ{form.memoOnly?"":" （省略可）"}</label>
-                        <textarea value={form.note||""} onChange={e=>setForm(f=>({...f,note:e.target.value}))}
-                          rows={form.memoOnly?3:2} placeholder="体調や気分など..."
-                          style={{...inputStyle,resize:"none",fontFamily:"inherit",
-                            borderColor:form.memoOnly?"#c4b5fd":"#fda4af"}}/>
-                      </div>
-                    </div>
-                    <div style={{display:"flex",gap:"10px",marginTop:"20px"}}>
-                      {form.id && (
-                        <button onClick={()=>handleDelete(form.id)}
-                          style={{padding:"10px 16px",borderRadius:12,border:"none",cursor:"pointer",
-                            background:"rgba(251,113,133,0.1)",color:"#f43f5e",fontSize:"13px",fontWeight:600}}>削除</button>
-                      )}
-                      <button onClick={()=>setModal(null)} style={{...btnGhost,flex:1}}>キャンセル</button>
-                      <button onClick={handleSave}
-                        disabled={form.memoOnly ? !form.note?.trim() : !form.start}
-                        style={{...btnPrimary,flex:1,
-                          background:form.memoOnly?"linear-gradient(135deg,#c4b5fd,#8b5cf6)":"linear-gradient(135deg,#f9a8d4,#fda4af)",
-                          opacity:(form.memoOnly ? form.note?.trim() : form.start)?1:0.5}}>保存</button>
-                    </div>
+                        <div style={{display:"flex",gap:"10px"}}>
+                          <button onClick={()=>setDeleteConfirm(false)} style={{...btnGhost,flex:1}}>キャンセル</button>
+                          <button onClick={()=>handleDelete(form.id)}
+                            style={{flex:1,borderRadius:12,padding:"10px 0",fontSize:"14px",fontWeight:700,
+                              background:"linear-gradient(135deg,#f87171,#f43f5e)",color:"#fff",border:"none",cursor:"pointer"}}>
+                            削除する
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <h2 style={{color:"#7c3a5a",fontSize:"16px",fontWeight:700,marginBottom:"16px"}}>
+                          {form.id ? "記録を編集" : form.memoOnly ? "メモを記録する" : "生理を記録する"} {form.memoOnly?"📝":"🌸"}
+                        </h2>
+                        <div style={{display:"flex",gap:"4px",marginBottom:"18px",background:"rgba(0,0,0,0.04)",borderRadius:14,padding:"4px"}}>
+                          <button onClick={()=>setForm(f=>({...f,memoOnly:false}))}
+                            style={{flex:1,padding:"8px 0",fontSize:"13px",borderRadius:10,border:"none",cursor:"pointer",
+                              fontWeight:!form.memoOnly?700:400,
+                              background:!form.memoOnly?"linear-gradient(135deg,#f9a8d4,#fda4af)":"transparent",
+                              color:!form.memoOnly?"#7c2d43":"#c084a0"}}>🩸 生理を記録</button>
+                          <button onClick={()=>setForm(f=>({...f,memoOnly:true}))}
+                            style={{flex:1,padding:"8px 0",fontSize:"13px",borderRadius:10,border:"none",cursor:"pointer",
+                              fontWeight:form.memoOnly?700:400,
+                              background:form.memoOnly?"linear-gradient(135deg,#c4b5fd,#8b5cf6)":"transparent",
+                              color:form.memoOnly?"#fff":"#c084a0"}}>📝 メモのみ</button>
+                        </div>
+                        {!form.memoOnly && !form.id && records.some(r=>!r.memoOnly&&!r.end) && (()=>{
+                          const og=records.find(r=>!r.memoOnly&&!r.end);
+                          return <div style={{borderRadius:12,padding:"12px",marginBottom:"4px",
+                            background:"rgba(251,113,133,0.08)",border:"1px solid rgba(251,113,133,0.25)"}}>
+                            <p style={{fontSize:"12px",color:"#f43f5e",margin:0,lineHeight:1.6}}>
+                              ⚠ {fromISO(og.start).getMonth()+1}月{fromISO(og.start).getDate()}日開始の記録に終了日が未入力です。先に終了日を入力してください。
+                            </p>
+                          </div>;
+                        })()}
+                        <div style={{display:"flex",flexDirection:"column",gap:"14px",marginBottom:"8px"}}>
+                          {!form.memoOnly && (
+                            <>
+                              <div>
+                                <label style={{fontSize:"12px",fontWeight:700,color:"#c084a0",display:"block",marginBottom:"6px"}}>開始日</label>
+                                <input type="date" value={form.start} onChange={e=>setForm(f=>({...f,start:e.target.value}))} style={inputStyle}/>
+                              </div>
+                              <div>
+                                <label style={{fontSize:"12px",fontWeight:700,color:"#c084a0",display:"block",marginBottom:"6px"}}>終了日（省略可）</label>
+                                <input type="date" value={form.end||""} onChange={e=>setForm(f=>({...f,end:e.target.value}))} style={inputStyle}/>
+                              </div>
+                            </>
+                          )}
+                          {form.memoOnly && (
+                            <div>
+                              <label style={{fontSize:"12px",fontWeight:700,color:"#8b5cf6",display:"block",marginBottom:"6px"}}>日付</label>
+                              <input type="date" value={form.start} onChange={e=>setForm(f=>({...f,start:e.target.value}))} style={{...inputStyle,borderColor:"#c4b5fd"}}/>
+                            </div>
+                          )}
+                          <div>
+                            <label style={{fontSize:"12px",fontWeight:700,display:"block",marginBottom:"6px",
+                              color:form.memoOnly?"#8b5cf6":"#c084a0"}}>
+                              メモ{form.memoOnly?"":" （省略可）"}</label>
+                            <textarea value={form.note||""} onChange={e=>setForm(f=>({...f,note:e.target.value}))}
+                              rows={form.memoOnly?3:2} placeholder="体調や気分など..."
+                              style={{...inputStyle,resize:"none",fontFamily:"inherit",
+                                borderColor:form.memoOnly?"#c4b5fd":"#fda4af"}}/>
+                          </div>
+                        </div>
+                        {form.start && (()=>{
+                          const sexKey=form.start; const hasSex=sexDates.has(sexKey);
+                          return (
+                            <button onClick={()=>toggleSex(sexKey)}
+                              style={{width:"100%",background:"none",border:"none",cursor:"pointer",
+                                borderTop:"1px solid rgba(249,168,212,0.2)",paddingTop:"12px",marginTop:"8px",marginBottom:"4px",
+                                display:"flex",alignItems:"center",gap:"8px",textAlign:"left"}}>
+                              <span style={{fontSize:"15px",lineHeight:1}}>{hasSex?"❤️":"🤍"}</span>
+                              <span style={{fontSize:"13px",color:hasSex?"#f43f5e":"#c084a0",fontWeight:hasSex?600:400}}>
+                                セックスした
+                              </span>
+                              {hasSex&&<span style={{marginLeft:"auto",fontSize:"11px",color:"#f43f5e",fontWeight:700}}>✓</span>}
+                            </button>
+                          );
+                        })()}
+                        <div style={{display:"flex",gap:"10px",marginTop:"12px"}}>
+                          {form.id && (records.find(r=>r.id===form.id)?.end || !form.end) && (
+                            <button onClick={()=>form.memoOnly ? handleDelete(form.id) : setDeleteConfirm(true)}
+                              style={{padding:"10px 16px",borderRadius:12,border:"none",cursor:"pointer",
+                                background:"rgba(251,113,133,0.1)",color:"#f43f5e",fontSize:"13px",fontWeight:600}}>削除</button>
+                          )}
+                          <button onClick={()=>setModal(null)} style={{...btnGhost,flex:1}}>キャンセル</button>
+                          <button onClick={handleSave}
+                            disabled={form.memoOnly ? !form.note?.trim() : (!form.start || (!form.id&&records.some(r=>!r.memoOnly&&!r.end)))}
+                            style={{...btnPrimary,flex:1,
+                              background:form.memoOnly?"linear-gradient(135deg,#c4b5fd,#8b5cf6)":"linear-gradient(135deg,#f9a8d4,#fda4af)",
+                              opacity:(form.memoOnly ? form.note?.trim() : (form.start&&(form.id||!records.some(r=>!r.memoOnly&&!r.end))))?1:0.5}}>保存</button>
+                        </div>
+                      </>
+                    )}
                   </div>
                 )}
 
@@ -734,6 +810,9 @@
                   const rec=records.find(r=>!r.memoOnly&&r.start<=selectedDay&&(r.end?r.end>=selectedDay:r.start===selectedDay));
                   const memoRec=records.find(r=>r.memoOnly&&r.start===selectedDay);
                   const tags=tagMap[selectedDay]||new Set();
+                  const hasSex=sexDates.has(selectedDay);
+                  const latestPeriod=[...records].filter(r=>!r.memoOnly).sort((a,b)=>b.start.localeCompare(a.start))[0];
+                  const isAfterOngoing=latestPeriod&&!latestPeriod.end&&latestPeriod.start<selectedDay;
                   return (
                     <div>
                       <h2 style={{color:"#7c3a5a",fontSize:"16px",fontWeight:700,marginBottom:"14px"}}>
@@ -761,7 +840,17 @@
                           <p style={{fontSize:"11px",color:"#9ca3af",fontStyle:"italic",margin:0}}>{memoRec.note}</p>
                         </div>
                       )}
-                      <div style={{display:"flex",gap:"10px"}}>
+                      <button onClick={()=>toggleSex(selectedDay)}
+                        style={{width:"100%",background:"none",border:"none",cursor:"pointer",
+                          borderTop:"1px solid rgba(249,168,212,0.2)",paddingTop:"12px",marginBottom:"14px",
+                          display:"flex",alignItems:"center",gap:"8px",textAlign:"left"}}>
+                        <span style={{fontSize:"15px",lineHeight:1}}>{hasSex?"❤️":"🤍"}</span>
+                        <span style={{fontSize:"13px",color:hasSex?"#f43f5e":"#c084a0",fontWeight:hasSex?600:400}}>
+                          セックスした
+                        </span>
+                        {hasSex && <span style={{marginLeft:"auto",fontSize:"11px",color:"#f43f5e",fontWeight:700}}>✓</span>}
+                      </button>
+                      <div style={{display:"flex",gap:"10px",flexWrap:"wrap"}}>
                         {rec && <button onClick={()=>{setForm({...rec,memoOnly:false});setModal("add");}}
                           style={{flex:1,...btnGhost,color:"#9f4e72",background:"rgba(249,168,212,0.2)"}}>編集</button>}
                         {rec && !memoRec && <button onClick={()=>{setForm({start:selectedDay,end:"",note:"",memoOnly:true});setModal("add");}}
@@ -769,7 +858,9 @@
                         {memoRec && <button onClick={()=>{setForm({...memoRec});setModal("add");}}
                           style={{flex:1,...btnGhost,color:"#7c3aed",background:"rgba(139,92,246,0.1)"}}>メモ編集</button>}
                         <button onClick={()=>setModal(null)} style={{...btnGhost,flex:1}}>閉じる</button>
-                        {!rec && <button onClick={()=>{setForm({start:selectedDay,end:"",note:"",memoOnly:false});setModal("add");}}
+                        {!rec && isAfterOngoing && <button onClick={()=>{setForm({...latestPeriod,end:selectedDay});setModal("add");}}
+                          style={{...btnPrimary,flex:1}}>終了日を設定</button>}
+                        {!rec && !isAfterOngoing && <button onClick={()=>{setForm({start:selectedDay,end:"",note:"",memoOnly:false});setModal("add");}}
                           style={{...btnPrimary,flex:1}}>生理を記録する</button>}
                       </div>
                     </div>
